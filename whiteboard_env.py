@@ -23,7 +23,6 @@ FOCUS_SIZE_PIX = FOCUS_SIZE_CM * PIXELS_PER_CM
 # Pen joint parameters
 PEN_MASS = 0.015  # in kg
 PEN_FRICTION_COEFF = 0.35  # friction coefficient for pen movement
-SCROLL_EXTRA_FRICTION = 0.8  # extra friction factor when in scrolling mode
 MAX_FORCE = 15.0  # maximum muscle-like force (N)
 
 # Vision joint parameters
@@ -37,17 +36,13 @@ MIN_Y, MAX_Y = 0, BOARD_HEIGHT_CM
 # Pen modes (only valid if moving pen)
 PEN_MODE_MOVE = 0  # moving without writing
 PEN_MODE_WRITE = 1  # writing mode
-PEN_MODE_SCROLL = 2  # scrolling mode
-
-# a rectangle where text is displayed by the environment
-FORBIDDEN_REGION = [10, 15, 5, 10]  # [x_min, x_max, y_min, y_max] in cm
 
 # =====================
 # Environment Class
 # =====================
 
 class WhiteboardEnv(gym.Env):
-    metadata = {"render_modes": ["human"], "render_fps": 120}
+    metadata = {"render_modes": ["human"], "render_fps": 60}
     
     def __init__(self, render_mode="human"):
         super(WhiteboardEnv, self).__init__()
@@ -72,12 +67,12 @@ class WhiteboardEnv(gym.Env):
 
         # Define action space: a Dict containing:
         # - 'joint_select': Discrete(2) (0 for pen, 1 for vision)
-        # - 'pen_mode': Discrete(3) (0: move, 1: write, 2: scroll)
+        # - 'pen_mode': Discrete(2) (0: move, 1: write)
         # - 'pen_force': Box(2,) in [-MAX_FORCE, MAX_FORCE]
         # - 'vision_force': Box(2,) in [-MAX_FORCE, MAX_FORCE]
         self.action_space = spaces.Dict({
             'joint_select': spaces.Discrete(2),
-            'pen_mode': spaces.Discrete(3),
+            'pen_mode': spaces.Discrete(2),
             'pen_force': spaces.Box(low=-MAX_FORCE, high=MAX_FORCE, shape=(2,), dtype=np.float32),
             'vision_force': spaces.Box(low=-MAX_FORCE, high=MAX_FORCE, shape=(2,), dtype=np.float32),
         })
@@ -117,7 +112,7 @@ class WhiteboardEnv(gym.Env):
         # Flags for human input
         self.human_pen_active = False
         self.human_drawing = False
-        self.human_scrolling = False
+        # self.human_scrolling = False
         self.human_cursor_pos = None
 
         # Continuous environment
@@ -175,12 +170,6 @@ class WhiteboardEnv(gym.Env):
             damping = EYE_FRICTION_COEFF
             mode = None  # Vision doesn't have modes
 
-        total_damping = damping
-        extra_damping = 0
-        if joint_type == 'ai_pen' and mode == PEN_MODE_SCROLL:
-            extra_damping = SCROLL_EXTRA_FRICTION
-
-        total_damping = damping + extra_damping
         gravity = 9.8
         static_friction_coeff = 0.4
         dynamic_friction_coeff = 0.2
@@ -188,11 +177,11 @@ class WhiteboardEnv(gym.Env):
 
         if np.linalg.norm(velocity) < small_threshold:
             if np.linalg.norm(last_applied_force) < static_friction_coeff * mass * gravity:
-                force = -total_damping * velocity # Only viscous damping
+                force = -damping * velocity # Only viscous damping
             else:
-                force = -total_damping * velocity - dynamic_friction_coeff * mass * gravity * velocity / (np.linalg.norm(velocity) + 1e-6) # Add dynamic friction
+                force = -damping * velocity - dynamic_friction_coeff * mass * gravity * velocity / (np.linalg.norm(velocity) + 1e-6) # Add dynamic friction
         else:
-            force = -total_damping * velocity - dynamic_friction_coeff * mass * gravity * velocity / (np.linalg.norm(velocity) + 1e-6) # Add dynamic friction
+            force = -damping * velocity - dynamic_friction_coeff * mass * gravity * velocity / (np.linalg.norm(velocity) + 1e-6) # Add dynamic friction
 
         return force
 
@@ -251,7 +240,7 @@ class WhiteboardEnv(gym.Env):
         self._update_joint('vision', vision_force)
         
         # Compute reward (placeholder).
-        reward = self._compute_reward(mode)
+        reward = 0
         
         self.done = False
         next_state = self.get_state()
@@ -277,18 +266,8 @@ class WhiteboardEnv(gym.Env):
             p = self.vision_pos
         else:
             raise ValueError("Invalid joint name.")
-
-        # If scrolling mode on the pen, add extra damping and boost force.
-        extra_damping = 0
-        if joint == 'ai_pen' and mode == PEN_MODE_SCROLL:
-            extra_damping = SCROLL_EXTRA_FRICTION
-            # Boost the vertical component only.
-            applied_force = np.array([0.0, applied_force[1] * 1.5], dtype=np.float32)
-
-        total_damping = damping + extra_damping
-
-        # Compute acceleration (semi-implicit Euler integration).
-        a = (applied_force - total_damping * v) / mass
+        
+        a = (applied_force - damping * v) / mass
         v_new = v + a * self.dt
         p_new = p + v_new * self.dt
 
@@ -306,27 +285,12 @@ class WhiteboardEnv(gym.Env):
         elif joint == 'ai_pen':
             # For the pen, define a margin so it never reaches the very edge.
             pen_margin = 2.0  # in cm
-            if mode == PEN_MODE_SCROLL:
-                # In scrolling mode, freeze the pen's position:
-                # Keep the horizontal coordinate within margins.
-                self.ai_pen_pos[0] = np.clip(self.ai_pen_pos[0], pen_margin, self.board_width_cm - pen_margin)
-                self.ai_pen_pos[1] = np.clip(self.ai_pen_pos[1], pen_margin, self.board_height_cm - pen_margin)
-                # Update scrolling only using the vertical component of applied_force.
-                scroll_scale = 2.0  # adjust as needed
-                delta_offset = int(applied_force[1] * scroll_scale * self.dt)
-                self.board_offset_y += delta_offset
-                # Freeze the pen's velocity.
-                self.ai_pen_vel = np.zeros(2, dtype=np.float32)
-                # Do not update pen position.
-                return  # Exit early for the pen update in scroll mode.
-            else:
-                # In move (mode 0) or write (mode 1) modes, update the pen normally.
-                p_new[0] = np.clip(p_new[0], pen_margin, self.board_width_cm - pen_margin)
-                p_new[1] = np.clip(p_new[1], pen_margin, self.board_height_cm - pen_margin)
-                if p_new[0] <= pen_margin or p_new[0] >= self.board_width_cm - pen_margin:
-                    v_new[0] = 0
-                if p_new[1] <= pen_margin or p_new[1] >= self.board_height_cm - pen_margin:
-                    v_new[1] = 0
+            p_new[0] = np.clip(p_new[0], pen_margin, self.board_width_cm - pen_margin)
+            p_new[1] = np.clip(p_new[1], pen_margin, self.board_height_cm - pen_margin)
+            if p_new[0] <= pen_margin or p_new[0] >= self.board_width_cm - pen_margin:
+                v_new[0] = 0
+            if p_new[1] <= pen_margin or p_new[1] >= self.board_height_cm - pen_margin:
+                v_new[1] = 0
         # --- End Boundary Enforcement ---
 
         # Update state.
@@ -340,14 +304,38 @@ class WhiteboardEnv(gym.Env):
             self.vision_pos = p_new
 
     def _draw_at_ai_pen(self):
-        """Draws an isolated dot representing the AI pen on the board."""
+        """Draws dots representing the AI pen on the board with density based on velocity."""
         x = int(self.ai_pen_pos[0] * self.pixels_per_cm)
         y = int(self.ai_pen_pos[1] * self.pixels_per_cm)
-        pygame.draw.circle(self.board_image, (0, 0, 0), (x, y), 3)
-
-    def _compute_reward(self, mode):
-        """Placeholder for reward calculation."""
-        return 0.0
+        
+        # Base dot size
+        dot_size = 3
+        
+        # Draw the main dot
+        pygame.draw.circle(self.board_image, (0, 0, 0), (x, y), dot_size)
+        
+        # Calculate velocity magnitude
+        vel_magnitude = np.linalg.norm(self.ai_pen_vel)
+        
+        # If moving at moderate speed, add intermediate dots to fill gaps
+        if vel_magnitude > 2.0:
+            # Add additional dots based on velocity
+            num_extra_dots = min(int(vel_magnitude / 2), 5)  # Limit maximum extra dots
+            
+            # Calculate previous position based on velocity vector
+            vel_direction = self.ai_pen_vel / (vel_magnitude + 1e-6)  # Avoid division by zero
+            
+            for i in range(1, num_extra_dots + 1):
+                # Place dots between current and previous position
+                factor = i / (num_extra_dots + 1)
+                prev_x = int((self.ai_pen_pos[0] - vel_direction[0] * factor * self.dt * vel_magnitude) * self.pixels_per_cm)
+                prev_y = int((self.ai_pen_pos[1] - vel_direction[1] * factor * self.dt * vel_magnitude) * self.pixels_per_cm)
+                
+                # Ensure coordinates are within bounds
+                if 0 <= prev_x < self.board_width_pix and 0 <= prev_y < self.board_height_pix:
+                    # Draw smaller dots for the intermediate positions
+                    smaller_dot_size = max(dot_size - 1, 2)
+                    pygame.draw.circle(self.board_image, (0, 0, 0), (prev_x, prev_y), smaller_dot_size)
 
     def _update_human_pen(self):
         """Updates human pen position based on mouse cursor."""
@@ -358,10 +346,38 @@ class WhiteboardEnv(gym.Env):
                 self._draw_at_human_pen()
 
     def _draw_at_human_pen(self):
-        """Draws an isolated blue dot representing the human pen on the board."""
+        """Draws dots representing the human pen on the board with density based on velocity."""
         x = int(self.human_pen_pos[0] * self.pixels_per_cm)
         y = int(self.human_pen_pos[1] * self.pixels_per_cm)
-        pygame.draw.circle(self.board_image, (0, 0, 255), (x, y), 3)
+        
+        # Base dot size
+        dot_size = 3
+        
+        # Draw the main dot (blue for human)
+        pygame.draw.circle(self.board_image, (0, 0, 255), (x, y), dot_size)
+        
+        # Calculate velocity magnitude
+        vel_magnitude = np.linalg.norm(self.human_pen_vel)
+        
+        # If moving at moderate speed, add intermediate dots to fill gaps
+        if vel_magnitude > 2.0:
+            # Add additional dots based on velocity
+            num_extra_dots = min(int(vel_magnitude / 2), 5)  # Limit maximum extra dots
+            
+            # Calculate previous position based on velocity vector
+            vel_direction = self.human_pen_vel / (vel_magnitude + 1e-6)  # Avoid division by zero
+            
+            for i in range(1, num_extra_dots + 1):
+                # Place dots between current and previous position
+                factor = i / (num_extra_dots + 1)
+                prev_x = int((self.human_pen_pos[0] - vel_direction[0] * factor * self.dt * vel_magnitude) * self.pixels_per_cm)
+                prev_y = int((self.human_pen_pos[1] - vel_direction[1] * factor * self.dt * vel_magnitude) * self.pixels_per_cm)
+                
+                # Ensure coordinates are within bounds
+                if 0 <= prev_x < self.board_width_pix and 0 <= prev_y < self.board_height_pix:
+                    # Draw smaller dots for the intermediate positions
+                    smaller_dot_size = max(dot_size - 1, 2)
+                    pygame.draw.circle(self.board_image, (0, 0, 255), (prev_x, prev_y), smaller_dot_size)
 
     def _update_human_scrolling(self):
         """Updates board_offset_y if human scrolling is active."""
@@ -377,6 +393,11 @@ class WhiteboardEnv(gym.Env):
             pygame.init()
             self.screen = pygame.display.set_mode((800, 600))
             pygame.display.set_caption("Whiteboard")
+        
+        # Ensure board_offset_y is within valid range
+        screen_width, screen_height = self.screen.get_size()
+        max_offset = max(0, self.board_height_pix - screen_height)
+        self.board_offset_y = np.clip(self.board_offset_y, 0, max_offset)
         
         board_to_show = self.board_image.copy()
         
@@ -400,14 +421,19 @@ class WhiteboardEnv(gym.Env):
         board_to_show.blit(tracker_surface, (tracker_x, tracker_y))
         pygame.draw.rect(board_to_show, (255, 0, 0), (tracker_x, tracker_y, tracker_size, tracker_size), 2)
         
-        # Extract viewport based on board_offset_y.
-        screen_width, screen_height = self.screen.get_size()
-        max_offset = max(0, self.board_height_pix - screen_height)
-        self.board_offset_y = np.clip(self.board_offset_y, 0, max_offset)
-        viewport_rect = pygame.Rect(0, self.board_offset_y, screen_width, screen_height)
+        # Extract viewport based on board_offset_y
+        viewport_rect = pygame.Rect(0, self.board_offset_y, screen_width, min(screen_height, self.board_height_pix - self.board_offset_y))
         viewport = board_to_show.subsurface(viewport_rect)
         
+        self.screen.fill((200, 200, 200))  # Fill with gray background
         self.screen.blit(viewport, (0, 0))
+        
+        # Draw scroll indicators if not at top/bottom
+        if self.board_offset_y > 0:
+            pygame.draw.polygon(self.screen, (80, 80, 80), [(screen_width//2 - 10, 15), (screen_width//2 + 10, 15), (screen_width//2, 5)])
+        if self.board_offset_y < max_offset:
+            pygame.draw.polygon(self.screen, (80, 80, 80), [(screen_width//2 - 10, screen_height-15), (screen_width//2 + 10, screen_height-15), (screen_width//2, screen_height-5)])
+        
         pygame.display.flip()
 
     def close(self):

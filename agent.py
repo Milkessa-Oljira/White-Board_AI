@@ -90,7 +90,7 @@ class Actor(nn.Module):
         
         # Additional layers for discrete actions
         self.joint_select = nn.Linear(hidden_dim, 2)  # 2 options
-        self.pen_mode = nn.Linear(hidden_dim, 3)      # 3 options
+        self.pen_mode = nn.Linear(hidden_dim, 2)      # 2 options
         
     def forward(self, x):
         x = F.relu(self.fc1(x))
