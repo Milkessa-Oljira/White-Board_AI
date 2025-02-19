@@ -68,7 +68,7 @@ instance/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+# *.ipynb
 
 # Coverage reports
 htmlcov/
