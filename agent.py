@@ -1,304 +1,297 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal
 import torch.optim as optim
 from collections import deque
-import random
+import pygame
+import threading
+import queue
+import gymnasium as gym
 
-class ReplayBuffer:
-    def __init__(self, capacity=100000):
-        self.buffer = deque(maxlen=capacity)
-    
-    def push(self, state, action, reward, next_state, done):
-        # Convert state and next_state to numpy arrays if they're not already
-        state_array = {
-            'image_array': np.array(state['image_array']),
-            'numeric': np.array(state['numeric'])
-        }
-        next_state_array = {
-            'image_array': np.array(next_state['image_array']),
-            'numeric': np.array(next_state['numeric'])
-        }
-        self.buffer.append((state_array, action, reward, next_state_array, done))
-    
-    def sample(self, batch_size):
-        samples = random.sample(self.buffer, batch_size)
+# Behavioral Memory Network (BMN)
+class BMN(nn.Module):
+    def __init__(self, obs_dim, act_dim, embed_dim=64, n_heads=4, n_layers=2):
+        super(BMN, self).__init__()
+        self.obs_encoder = nn.Linear(obs_dim, embed_dim)
+        self.act_encoder = nn.Linear(act_dim, embed_dim)
+        self.reward_encoder = nn.Linear(1, embed_dim)
+        self.transformer = nn.Transformer(embed_dim, n_heads, n_layers, batch_first=True)
+        self.fc_out = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, obs, act, rew):
+        obs = obs.unsqueeze(1)  # [batch, 1, obs_dim]
+        act = act.unsqueeze(1)  # [batch, 1, act_dim]
+        rew = rew.unsqueeze(1)  # [batch, 1, 1]
         
-        # Separate the components
-        states = [s[0] for s in samples]
-        actions = [s[1] for s in samples]
-        rewards = [s[2] for s in samples]
-        next_states = [s[3] for s in samples]
-        dones = [s[4] for s in samples]
-        
-        # Combine the dictionaries
-        state_batch = {
-            'image_array': np.stack([s['image_array'] for s in states]),
-            'numeric': np.stack([s['numeric'] for s in states])
-        }
-        next_state_batch = {
-            'image_array': np.stack([s['image_array'] for s in next_states]),
-            'numeric': np.stack([s['numeric'] for s in next_states])
-        }
-        
-        return (
-            state_batch,
-            np.array(actions),
-            np.array(rewards, dtype=np.float32),
-            next_state_batch,
-            np.array(dones, dtype=np.float32)
+        obs_embed = self.obs_encoder(obs)
+        act_embed = self.act_encoder(act)
+        rew_embed = self.reward_encoder(rew)
+        combined = obs_embed + act_embed + rew_embed
+        memory = self.transformer(combined, combined)
+        return self.fc_out(memory[:, -1])
+
+# Curiosity Module
+class CuriosityModule(nn.Module):
+    def __init__(self, visual_shape, act_dim, hidden_dim=128):
+        super(CuriosityModule, self).__init__()
+        self.visual_encoder = nn.Sequential(
+            nn.Conv2d(3, 16, 4, stride=2), nn.ReLU(),  # (16, 436, 498)
+            nn.Conv2d(16, 32, 4, stride=2), nn.ReLU()  # (32, 216, 247)
         )
-    
-    def clear(self):
-        self.buffer.clear()
-        
-    def __len__(self):
-        return len(self.buffer)
+        with torch.no_grad():
+            test_input = torch.zeros(1, 3, visual_shape[0], visual_shape[1])
+            conv_out = self.visual_encoder(test_input)
+            flat_size = conv_out.numel() // conv_out.shape[0]
+        self.flatten = nn.Flatten()
+        self.linear = nn.Linear(flat_size, hidden_dim)
+        self.act_encoder = nn.Linear(act_dim, hidden_dim)
+        self.predictor = nn.Linear(hidden_dim * 2, hidden_dim)
 
-class CNNEncoder(nn.Module):
-    def __init__(self, height, width):
-        super(CNNEncoder, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        
-        # Calculate output size
-        h = (((height - 8)//4 + 1) - 4)//2 + 1 - 3 + 1
-        w = (((width - 8)//4 + 1) - 4)//2 + 1 - 3 + 1
-        self.fc = nn.Linear(64 * h * w, 512)
-        
-    def forward(self, x):
-        x = x.permute(0, 3, 1, 2) / 255.0  # Normalize and reshape for CNN
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc(x))
-        return x
+    def forward(self, visual, act, next_visual):
+        v_enc = self.linear(self.flatten(self.visual_encoder(visual)))
+        a_enc = self.act_encoder(act)
+        combined = torch.cat([v_enc, a_enc], dim=-1)
+        pred = self.predictor(combined)
+        next_v_enc = self.linear(self.flatten(self.visual_encoder(next_visual)))
+        curiosity = torch.mean((pred - next_v_enc) ** 2)
+        return curiosity
 
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(Actor, self).__init__()
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Mean and log_std for all continuous actions
-        self.mean = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Linear(hidden_dim, action_dim)
-        
-        # Additional layers for discrete actions
-        self.joint_select = nn.Linear(hidden_dim, 2)  # 2 options
-        self.pen_mode = nn.Linear(hidden_dim, 2)      # 2 options
-        
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        
-        # Continuous actions
-        mean = self.mean(x)
-        log_std = self.log_std(x)
+# Intention and Motor Policies
+class IntentionPolicy(nn.Module):
+    def __init__(self, embed_dim, n_intentions=4):
+        super(IntentionPolicy, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 128), nn.ReLU(),
+            nn.Linear(128, n_intentions), nn.Softmax(dim=-1)
+        )
+
+    def forward(self, embed):
+        return self.net(embed)
+
+class MotorPolicy(nn.Module):
+    def __init__(self, embed_dim, intention_dim, act_dim=6):
+        super(MotorPolicy, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim + intention_dim, 128), nn.ReLU(),
+            nn.Linear(128, act_dim * 2)  # Mean and log_std
+        )
+
+    def forward(self, embed, intention):
+        x = torch.cat([embed, intention], dim=-1)
+        out = self.net(x)
+        mean, log_std = out.chunk(2, dim=-1)
         log_std = torch.clamp(log_std, -20, 2)
-        
-        # Discrete actions
-        joint_prob = F.softmax(self.joint_select(x), dim=-1)
-        pen_prob = F.softmax(self.pen_mode(x), dim=-1)
-        
-        return mean, log_std, joint_prob, pen_prob
+        dist = torch.distributions.Normal(mean, log_std.exp())
+        action_raw = dist.sample()
+        return action_raw, dist
 
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(Critic, self).__init__()
-        
-        # Q1
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.q1 = nn.Linear(hidden_dim, 1)
-        
-        # Q2
-        self.fc3 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
-        self.q2 = nn.Linear(hidden_dim, 1)
-        
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=1)
-        
-        q1 = F.relu(self.fc1(x))
-        q1 = F.relu(self.fc2(q1))
-        q1 = self.q1(q1)
-        
-        q2 = F.relu(self.fc3(x))
-        q2 = F.relu(self.fc4(q2))
-        q2 = self.q2(q2)
-        
-        return q1, q2
+# HGABL Agent
+class HGABLAgent:
+    def __init__(self):
+        """Initialize the agent with environment, models, and threading."""
+        self.env = gym.make('WhiteboardEnv-v0', render_mode="human").unwrapped
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class SACAgent:
-    def __init__(self, env_dims, device="cpu", alpha=0.2):
-        self.device = torch.device(device)
-        self.alpha = alpha  # entropy coefficient
-        
-        # Initialize dimensions
-        self.image_height = env_dims['image_height']
-        self.image_width = env_dims['image_width']
-        self.numeric_dim = env_dims['numeric_dim']
-        self.action_dim = 6  # 2 force vectors (2D each) + 2 discrete actions
-        
-        # Initialize networks
-        self.cnn = CNNEncoder(self.image_height, self.image_width).to(device)
-        state_dim = 512 + self.numeric_dim  # CNN output + numeric input
-        
-        self.actor = Actor(state_dim, 4).to(device)  # 4 for continuous actions
-        self.critic = Critic(state_dim, self.action_dim).to(device)
-        self.critic_target = Critic(state_dim, self.action_dim).to(device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        
-        # Initialize optimizers
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
-        
-        # Initialize replay buffer
-        self.replay_buffer = ReplayBuffer()
-        
-        # Training parameters
-        self.batch_size = 256
-        self.gamma = 0.99
-        self.tau = 0.005
-        
-    def select_action(self, state, evaluate=False):
+        # Dimensions
+        self.visual_dim = 128
+        obs_dim = self.env.observation_space["numeric"].shape[0] + self.visual_dim  # 4 + 128
+        act_dim = 6  # joint_select, pen_mode, pen_force (2), vision_force (2)
+        visual_shape = (self.env.board_height_pix, self.env.board_width_pix)  # (875, 1000)
+        self.n_intentions = 4
+
+        # Models
+        self.bmn = BMN(obs_dim, act_dim).to(self.device)
+        self.curiosity = CuriosityModule(visual_shape, act_dim).to(self.device)
+        self.intention_policy = IntentionPolicy(64, self.n_intentions).to(self.device)
+        self.motor_policy = MotorPolicy(64, self.n_intentions).to(self.device)
+
+        # Optimizers
+        self.bmn_opt = optim.Adam(self.bmn.parameters(), lr=1e-4)
+        self.curiosity_opt = optim.Adam(self.curiosity.parameters(), lr=1e-4)
+        self.intention_opt = optim.Adam(self.intention_policy.parameters(), lr=1e-4)
+        self.motor_opt = optim.Adam(self.motor_policy.parameters(), lr=1e-4)
+
+        # Buffers
+        self.memory = deque(maxlen=1000)
+        self.behavior_embeddings = []
+
+        # Threading for learning
+        self.learn_queue = queue.Queue()
+        self.learn_thread = threading.Thread(target=self._learn_thread)
+        self.learn_thread.daemon = True
+        self.learn_thread.start()
+
+        self.step_count = 0
+
+    def preprocess_visual(self, visual):
+        """Preprocess visual input to a 128-dimensional embedding."""
+        visual_array = np.transpose(visual, (2, 0, 1))  # [channels, height, width]
+        visual_tensor = torch.FloatTensor(visual_array).unsqueeze(0).to(self.device) / 255.0
+        return self.curiosity.linear(self.curiosity.flatten(self.curiosity.visual_encoder(visual_tensor)))
+
+    def preprocess_raw_visual(self, visual):
+        """Preprocess raw visual input for curiosity module."""
+        visual_array = np.transpose(visual, (2, 0, 1))  # [channels, height, width]
+        return torch.FloatTensor(visual_array).to(self.device) / 255.0
+
+    def get_full_obs(self, obs):
+        """Combine numeric and visual observations into a full observation tensor."""
+        numeric = torch.FloatTensor(obs["numeric"]).unsqueeze(0).to(self.device)
+        visual_embed = self.preprocess_visual(obs["image_array"])
+        return torch.cat([numeric, visual_embed], dim=-1)
+
+    def act(self, obs, behavior_embed):
+        """Generate an action based on the current observation and behavior embedding."""
         with torch.no_grad():
-            # Process state
-            image = torch.FloatTensor(state['image_array']).unsqueeze(0).to(self.device)
-            numeric = torch.FloatTensor(state['numeric']).unsqueeze(0).to(self.device)
-            
-            # Get CNN features
-            image_features = self.cnn(image)
-            state_features = torch.cat([image_features, numeric], dim=1)
-            
-            # Get action distributions
-            mean, log_std, joint_prob, pen_prob = self.actor(state_features)
-            std = log_std.exp()
-            
-            if evaluate:
-                continuous_action = mean
-                joint_select = torch.argmax(joint_prob, dim=1)
-                pen_mode = torch.argmax(pen_prob, dim=1)
-            else:
-                # Sample continuous actions
-                normal = Normal(mean, std)
-                continuous_action = normal.rsample()
-                
-                # Sample discrete actions
-                joint_select = torch.multinomial(joint_prob, 1)
-                pen_mode = torch.multinomial(pen_prob, 1)
-            
-            # Combine actions
-            continuous_action = torch.tanh(continuous_action)
-            action_array = np.zeros(6)
-            action_array[0] = joint_select.cpu().numpy()[0]
-            action_array[1] = pen_mode.cpu().numpy()[0]
-            action_array[2:6] = continuous_action.cpu().numpy()[0]
-            
-            return action_array
-    
-    def store_transition(self, state, action, reward, next_state, done):
-        self.replay_buffer.push(state, action, reward, next_state, done)
-    
-    def update(self):
-        if len(self.replay_buffer) < self.batch_size:
-            return
+            intention_probs = self.intention_policy(behavior_embed)
+            action_raw, _ = self.motor_policy(behavior_embed, intention_probs)
         
-        # Sample from replay buffer
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = \
-            self.replay_buffer.sample(self.batch_size)
-        
-        # Convert to tensors
-        state_tensors = {
-            'image_array': torch.FloatTensor(state_batch['image_array']).to(self.device),
-            'numeric': torch.FloatTensor(state_batch['numeric']).to(self.device)
+        action = {
+            "joint_select": int((action_raw[0, 0] > 0).item()),
+            "pen_mode": int((action_raw[0, 1] > 0).item()),
+            "pen_force": action_raw[0, 2:4].cpu().numpy().astype(np.float32),
+            "vision_force": action_raw[0, 4:6].cpu().numpy().astype(np.float32)
         }
-        next_state_tensors = {
-            'image_array': torch.FloatTensor(next_state_batch['image_array']).to(self.device),
-            'numeric': torch.FloatTensor(next_state_batch['numeric']).to(self.device)
-        }
-        action_tensors = torch.FloatTensor(action_batch).to(self.device)
-        reward_tensors = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
-        done_tensors = torch.FloatTensor(done_batch).unsqueeze(1).to(self.device)
+        return action, intention_probs
 
-        # Process state features
-        current_features = torch.cat([
-            self.cnn(state_tensors['image_array']),
-            state_tensors['numeric']
-        ], dim=1)
+    def _learn_thread(self):
+        """Background thread to process learning batches from the queue."""
+        while True:
+            try:
+                batch = self.learn_queue.get(timeout=1.0)
+                self.learn(batch)
+            except queue.Empty:
+                continue
+
+    def learn(self, batch):
+        """Update models based on a batch of experiences."""
+        obs, act, rew, next_obs = zip(*batch)
         
-        # Get current Q estimates
-        current_Q1, current_Q2 = self.critic(current_features, action_tensors)
+        # Convert to tensors efficiently
+        obs_full = torch.cat([self.get_full_obs(o) for o in obs]).to(self.device)
+        obs_visual = torch.stack([self.preprocess_raw_visual(o["image_array"]) for o in obs]).to(self.device)
+        act_array = np.array([
+            np.concatenate([np.array([a["joint_select"], a["pen_mode"]]), a["pen_force"], a["vision_force"]])
+            for a in act
+        ])
+        act_tensor = torch.FloatTensor(act_array).to(self.device)
+        rew_tensor = torch.FloatTensor(np.array(rew)).unsqueeze(-1).to(self.device)
+        next_visual = torch.stack([self.preprocess_raw_visual(o["image_array"]) for o in next_obs]).to(self.device)
 
-        # Process next state features
-        with torch.no_grad():
-            next_features = torch.cat([
-                self.cnn(next_state_tensors['image_array']),
-                next_state_tensors['numeric']
-            ], dim=1)
-            
-            next_mean, next_log_std, next_joint_prob, next_pen_prob = self.actor(next_features)
-            next_std = next_log_std.exp()
-            next_normal = Normal(next_mean, next_std)
-            next_action = torch.tanh(next_normal.rsample())
-            
-            # Compute target Q value
-            target_Q1, target_Q2 = self.critic_target(next_features, next_action)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = reward_tensors + (1 - done_tensors) * self.gamma * target_Q
+        # Update BMN
+        behavior_embed = self.bmn(obs_full, act_tensor, rew_tensor)
+        self.bmn_opt.zero_grad()
+        bmn_loss = torch.mean(behavior_embed ** 2)  # Regularization
+        bmn_loss.backward()
+        self.bmn_opt.step()
+        behavior_embed = behavior_embed.detach()
 
-        # Compute critic loss
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        # Curiosity Reward
+        curiosity_loss = self.curiosity(obs_visual, act_tensor, next_visual)
+        self.curiosity_opt.zero_grad()
+        curiosity_loss.backward()
+        self.curiosity_opt.step()
+        curiosity_reward = curiosity_loss.detach().cpu().numpy()
 
-        # Optimize critic
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
+        # Human Feedback Amplification
+        total_reward = rew_tensor + 0.1 * curiosity_reward
 
-        # Compute actor loss
-        mean, log_std, joint_prob, pen_prob = self.actor(current_features)
-        std = log_std.exp()
-        normal = Normal(mean, std)
-        action = torch.tanh(normal.rsample())
-        
-        Q1, Q2 = self.critic(current_features, action)
-        Q = torch.min(Q1, Q2)
-        
-        actor_loss = -Q.mean()
-        
-        # Add entropy term
-        entropy = normal.entropy().mean()
-        actor_loss += -self.alpha * entropy
+        # Policy Update
+        intention_probs = self.intention_policy(behavior_embed)
+        action_raw, motor_dist = self.motor_policy(behavior_embed, intention_probs)
+        intention_loss = -total_reward.mean() * torch.log(intention_probs + 1e-6).mean()
+        motor_loss = -total_reward.mean() * motor_dist.log_prob(act_tensor).mean()
 
-        # Optimize actor
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        # Combined loss for efficiency
+        total_loss = intention_loss + motor_loss
 
-        # Update target networks
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        self.intention_opt.zero_grad()
+        self.motor_opt.zero_grad()
+        total_loss.backward()
+        self.intention_opt.step()
+        self.motor_opt.step()
 
-    def save(self, filename):
-        torch.save({
-            'cnn_state_dict': self.cnn.state_dict(),
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-        }, filename)
+        if rew_tensor.abs().sum() > 0:
+            self.behavior_embeddings.append((behavior_embed.detach(), total_reward.mean().item()))
+
+    def run(self):
+        """Main loop to run the agent."""
+        obs, _ = self.env.reset()
+        behavior_embed = torch.zeros(1, 64).to(self.device)
+        clock = pygame.time.Clock()
+
+        while True:
+            # Handle human input
+            reward = 0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.env.close()
+                    return
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_1:
+                        reward = 1
+                    elif event.key == pygame.K_2:
+                        reward = -1
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        self.env.human_pen_active = True
+                        self.env.human_drawing = True
+                        self.env.human_cursor_pos = np.array(event.pos) / self.env.pixels_per_cm
+                    elif event.button == 3:
+                        self.env.human_scrolling = True
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self.env.human_drawing = False
+                    elif event.button == 3:
+                        self.env.human_scrolling = False
+                elif event.type == pygame.MOUSEMOTION and self.env.human_pen_active:
+                    self.env.human_cursor_pos = np.array(event.pos) / self.env.pixels_per_cm
+
+            # Agent action
+            action, intention_probs = self.act(obs, behavior_embed)
+            next_obs, _, done, _, info = self.env.step(action)
+
+            # Store experience
+            self.memory.append((obs, action, reward, next_obs))
+
+            # Queue learning periodically
+            self.step_count += 1
+            if self.step_count % 10 == 0 and len(self.memory) >= 32:
+                indices = np.random.choice(len(self.memory), 32, replace=False)
+                batch = [self.memory[i] for i in indices]
+                self.learn_queue.put(batch)
+
+            # Render and update
+            self.env.render()
+            obs = next_obs
+            clock.tick(self.env.metadata["render_fps"])
     
-    def load(self, filename):
-        checkpoint = torch.load(filename)
-        self.cnn.load_state_dict(checkpoint['cnn_state_dict'])
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+    def save_state(self, file_path):
+        """Save the agent's state to a file."""
+        state = {
+            'bmn': self.bmn.state_dict(),
+            'curiosity': self.curiosity.state_dict(),
+            'intention_policy': self.intention_policy.state_dict(),
+            'motor_policy': self.motor_policy.state_dict(),
+            'bmn_opt': self.bmn_opt.state_dict(),
+            'curiosity_opt': self.curiosity_opt.state_dict(),
+            'intention_opt': self.intention_opt.state_dict(),
+            'motor_opt': self.motor_opt.state_dict(),
+            'memory': list(self.memory),
+            'step_count': self.step_count,
+        }
+        torch.save(state, file_path)
+
+    def load_state(self, file_path):
+        """Load the agent's state from a file."""
+        state = torch.load(file_path)
+        self.bmn.load_state_dict(state['bmn'])
+        self.curiosity.load_state_dict(state['curiosity'])
+        self.intention_policy.load_state_dict(state['intention_policy'])
+        self.motor_policy.load_state_dict(state['motor_policy'])
+        self.bmn_opt.load_state_dict(state['bmn_opt'])
+        self.curiosity_opt.load_state_dict(state['curiosity_opt'])
+        self.intention_opt.load_state_dict(state['intention_opt'])
+        self.motor_opt.load_state_dict(state['motor_opt'])
+        self.memory = deque(state['memory'], maxlen=1000)
+        self.step_count = state['step_count']
